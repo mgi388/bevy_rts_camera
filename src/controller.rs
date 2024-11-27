@@ -15,7 +15,7 @@ impl Plugin for RtsCameraControlsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(CursorRayPlugin).add_systems(
             Update,
-            (zoom, pan, grab_pan, rotate).before(RtsCameraSystemSet),
+            (zoom, pan, grab_pan, grab_pan2, rotate).before(RtsCameraSystemSet),
         );
     }
 }
@@ -77,6 +77,9 @@ pub struct RtsCameraControls {
     /// Whether to lock the mouse cursor in place while dragging.
     /// Defaults to `false`.
     pub lock_on_drag: bool,
+    /// The mouse button used to 'drag pan' the camera, along with a key
+    /// modifier.
+    pub button_key_drag: Option<(MouseButton, KeyCode)>,
     /// How far away from the side of the screen edge pan will kick in, defined as a percentage
     /// of the window's height. Set to `0.0` to disable edge panning.
     /// Defaults to `0.05` (5%).
@@ -106,6 +109,7 @@ impl Default for RtsCameraControls {
             lock_on_rotate: false,
             button_drag: None,
             lock_on_drag: false,
+            button_key_drag: None,
             edge_pan_width: 0.05,
             pan_speed: 15.0,
             zoom_sensitivity: 1.0,
@@ -144,6 +148,12 @@ pub fn pan(
             .button_drag
             .map_or(false, |btn| mouse_input.pressed(btn))
         {
+            continue;
+        }
+
+        if controller.button_key_drag.map_or(false, |(btn, key)| {
+            mouse_input.pressed(btn) && button_input.pressed(key)
+        }) {
             continue;
         }
 
@@ -255,6 +265,74 @@ pub fn grab_pan(
         }
 
         if mouse_button.pressed(drag_button) {
+            let mut mouse_delta = mouse_motion.read().map(|e| e.delta).sum::<Vec2>();
+
+            let mut multiplier = 1.0;
+            let vp_size = camera.logical_viewport_size().unwrap();
+            match *projection {
+                Projection::Perspective(ref p) => {
+                    mouse_delta *= Vec2::new(p.fov * p.aspect_ratio, p.fov) / vp_size;
+                    multiplier = (*ray_hit).map_or_else(
+                        || cam_tfm.translation.distance(cam.focus.translation),
+                        |hit| hit.distance(cam_tfm.translation),
+                    );
+                }
+                Projection::Orthographic(ref p) => {
+                    mouse_delta *= Vec2::new(p.area.width(), p.area.height()) / vp_size;
+                }
+            }
+
+            let mut delta = Vec3::ZERO;
+            delta += cam.target_focus.forward() * mouse_delta.y;
+            delta += cam.target_focus.right() * -mouse_delta.x;
+            cam.target_focus.translation += delta * multiplier;
+        }
+    }
+}
+
+pub fn grab_pan2(
+    mut cam_q: Query<(
+        &Transform,
+        &mut RtsCamera,
+        &RtsCameraControls,
+        &Camera,
+        &Projection,
+    )>,
+    button_input: Res<ButtonInput<KeyCode>>,
+    mut mouse_motion: EventReader<MouseMotion>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    mut raycast: Raycast,
+    cursor_ray: Res<CursorRay>,
+    mut ray_hit: Local<Option<Vec3>>,
+    ground_q: Query<Entity, With<Ground>>,
+) {
+    for (cam_tfm, mut cam, controller, camera, projection) in
+        cam_q.iter_mut().filter(|(_, _, ctrl, _, _)| ctrl.enabled)
+    {
+        let Some((drag_button, drag_key)) = controller.button_key_drag else {
+            continue;
+        };
+
+        if mouse_button.just_pressed(drag_button) && button_input.pressed(drag_key) {
+            if let Some(cursor_ray) = **cursor_ray {
+                *ray_hit = raycast
+                    .cast_ray(
+                        cursor_ray,
+                        &RaycastSettings {
+                            filter: &|entity| ground_q.get(entity).is_ok(),
+                            ..default()
+                        },
+                    )
+                    .first()
+                    .map(|(_, hit)| hit.position());
+            }
+        }
+
+        if mouse_button.just_released(drag_button) {
+            *ray_hit = None;
+        }
+
+        if mouse_button.pressed(drag_button) && button_input.pressed(drag_key) {
             let mut mouse_delta = mouse_motion.read().map(|e| e.delta).sum::<Vec2>();
 
             let mut multiplier = 1.0;
